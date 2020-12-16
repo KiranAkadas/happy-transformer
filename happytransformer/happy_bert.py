@@ -14,7 +14,9 @@ from transformers import (
 )
 
 import torch
-
+import pandas as pd
+from torch.utils.data import DataLoader
+from transformers import AdamW
 from happytransformer.happy_transformer import HappyTransformer
 
 
@@ -53,6 +55,74 @@ class HappyBERT(HappyTransformer):
         self.mlm = BertForMaskedLM.from_pretrained(self.model)
         self.mlm.eval()
 
+    def read_dataset(self,path):
+        f=pd.read_excel(path, engine='openpyxl')
+        con1= f['CONTEXT'].tolist()
+        a1= f['a1'].tolist()
+        a2= f['a2'].tolist()
+        a3= f['a3'].tolist()
+        q=["What time is the appointment?","what calendar date is the appointment?","who is the appointment with?"]
+        contexts = []
+        questions = []
+        answers = []
+        for i,c in enumerate(con1):
+            contexts.append(c)
+            questions.append(q[0])
+            answers.append(a1[i])
+            contexts.append(c)
+            questions.append(q[1])
+            answers.append(a2[i])
+            contexts.append(c)
+            questions.append(q[2])
+            answers.append(a3[i])
+
+        return contexts, questions, answers
+
+    def add_token_positions(self,encodings, answers):
+        start_positions = []
+        end_positions = []
+        for i in range(len(answers)):
+            start_positions.append(encodings.char_to_token(i, answers[i]['answer_start']))
+            end_positions.append(encodings.char_to_token(i, answers[i]['answer_end'] - 1))
+            # if None, the answer passage has been truncated
+            if start_positions[-1] is None:
+                start_positions[-1] = tokenizer.model_max_length
+            if end_positions[-1] is None:
+                end_positions[-1] = tokenizer.model_max_length
+        encodings.update({'start_positions': start_positions, 'end_positions': end_positions})
+
+    def train(self):
+        self.model=BertForQuestionAnswering.from_pretrained('bert-large-uncased-whole-word-masking-finetuned-squad')
+        train_contexts,train_questions,train_answers = self.read_dataset("dataset.xlsx")
+        val_contexts,val_questions,val_answers = self.read_dataset("valdataset.xlsx")
+        train_encodings = self.tokenizer(train_contexts, train_questions, truncation=True, padding=True)
+        val_encodings = self.tokenizer(val_contexts, val_questions, truncation=True, padding=True)
+        self.add_token_positions(train_encodings, train_answers)
+        self.add_token_positions(val_encodings, val_answers)
+
+        device = torch.device('cuda') if torch.cuda.is_available() else torch.device('cpu')
+
+        self.model.to(device)
+        self.model.train()
+
+        train_loader = DataLoader(train_dataset, batch_size=16, shuffle=True)
+
+        optim = AdamW(self.model.parameters(), lr=5e-5)
+
+        for epoch in range(3):
+            for batch in train_loader:
+                optim.zero_grad()
+                input_ids = batch['input_ids'].to(device)
+                attention_mask = batch['attention_mask'].to(device)
+                start_positions = batch['start_positions'].to(device)
+                end_positions = batch['end_positions'].to(device)
+                outputs = model(input_ids, attention_mask=attention_mask, start_positions=start_positions, end_positions=end_positions)
+                loss = outputs[0]
+                loss.backward()
+                optim.step()
+
+        self.model.eval()
+
     def _get_next_sentence_prediction(self):
         """
         Initializes the BertForNextSentencePrediction transformer
@@ -68,15 +138,15 @@ class HappyBERT(HappyTransformer):
         self.qa = BertForQuestionAnswering.from_pretrained('bert-large-uncased-whole-word-masking-finetuned-squad')
         self.qa.eval()
 
-    def predict_next_sentence(self, sentence_a, sentence_b, use_probability=False):
+    def predict_next_sentence(self, sentence_a, sentence_b):
         """
         Determines if sentence B is likely to be a continuation after sentence
         A.
         :param sentence_a: First sentence
         :param sentence_b: Second sentence to test if it comes after the first
-        :param use_probability: Toggle outputting probability instead of boolean
-        :return Result of whether sentence B follows sentence A,
-                as either a probability or a boolean
+        :return tuple: True if b is likely to follow a, False if b is unlikely
+                       to follow a, with the probabilities as the second item
+                       of the tuple
         """
 
         if not self.__is_one_sentence(sentence_a) or not  self.__is_one_sentence(sentence_b):
@@ -95,14 +165,9 @@ class HappyBERT(HappyTransformer):
         with torch.no_grad():
             predictions = self.nsp(tokens_tensor, token_type_ids=segments_tensors)[0]
 
-        probabilities = torch.nn.Softmax(dim=1)(predictions)
-        # probability that sentence B follows sentence A
-        correct_probability = probabilities[0][0].item()
-
-        return (
-            correct_probability if use_probability else 
-            correct_probability >= 0.5
-        )
+        if predictions[0][0] >= predictions[0][1]:
+            return True
+        return False
 
     def __is_one_sentence(self, text):
         """
@@ -141,13 +206,11 @@ class HappyBERT(HappyTransformer):
         token_tensor = torch.tensor([input_ids])
         segment_tensor = torch.tensor([token_type_ids])
         with torch.no_grad():
-           scores=  self.qa(input_ids=token_tensor,
-                    token_type_ids=segment_tensor)
-           start_scores = scores[0]
-           end_scores = scores[1]
+            scores= self.qa(input_ids=token_tensor,
+                                               token_type_ids=segment_tensor)
         all_tokens = self.tokenizer.convert_ids_to_tokens(input_ids)
-        answer_list = all_tokens[torch.argmax(start_scores):
-                                 torch.argmax(end_scores)+1]
+        answer_list = all_tokens[torch.argmax(scores[0]):
+                                 torch.argmax(scores[1])+1]
         answer = self.tokenizer.convert_tokens_to_string(answer_list)
         answer = answer.replace(' \' ', '\' ').replace('\' s ', '\'s ')
         return answer
